@@ -1,0 +1,585 @@
+---
+title: "VSV 2023 California Outbreak"
+description: " "
+date: "2025-04-18"
+categories: [R, VSNJ, Phylogeography]
+output-dir: docs
+format:
+  gfm:
+   toc: true
+   toc-depth: 2
+   code-fold: show
+   code-summary: "Hide code"
+   preview-mode: raw
+editor: source
+editor_options:  
+  chunk_output_type: console
+---
+
+## Preliminaries
+### Libraries
+```{r warning=FALSE, message=FALSE, echo=TRUE}
+library(here)
+library(tidyverse)
+library(scales)
+
+#spatial
+library(ggmap)
+library(ggspatial)
+library(sf)
+library(tigris)
+library(terra)
+library(rnaturalearth) # global geographic data
+library(rnaturalearthhires)
+library(rnaturalearthdata)
+
+# Phylo
+library(ape) #Analyses of Phylogenetics and Evolution (APE)
+library(phangorn) # phylogenetic trees and networks
+library(treeio)
+library(Biostrings) # sequence wrangling
+library(msa) # Multiple Sequence Alignment (MSA) algorithms  
+library(ggtree) # tree visualization and annotation
+```
+
+
+### Custom Functions
+```{r}
+source(here("R/utilities.R"))
+source_dir(here("R"))
+```
+
+
+## Geographic Boundaries
+
+### California Counties
+```{r}
+options(tigris_use_cache = TRUE)
+
+ca_counties <- counties(state = "CA", year = 2022, class = "sf")
+```
+
+
+### Get Centroids
+```{r}
+ca_centroids_sf <- st_centroid(ca_counties)
+
+# to SpatVector
+ca_centroids_sv <- vect(ca_centroids_sf)
+
+coord_frame <- as.data.frame(ca_centroids_sv, geom="xy") %>%
+  mutate(county = NAME) %>%
+  select(county, x, y)
+```
+
+## VSV Data
+### Get Metadata
+```{r}
+vsv_meta <- readxl::read_excel(here("local/Filesnames 1.xlsx"), .name_repair="universal")
+names(vsv_meta) <- c("fastq", "meta", "tip", "horse", "date", "county")
+
+vsv_meta <- vsv_meta %>%
+  mutate(date = as_date(date),
+         tip = gsub("-", "_", tip)) %>%
+  select(tip, date, county)
+
+head(vsv_meta)
+str(vsv_meta)
+
+#get labels
+keep_labels <- c(vsv_meta$tip, "Mexico2023") # also keep MX sample
+
+length(keep_labels)
+```
+
+### Load and Filter Alignment
+```{r}
+alignment <- read.dna(here("local/world.fasta"),
+                      format="fasta")
+
+class(alignment)
+
+matched_labels <- keep_labels[keep_labels %in% rownames(alignment)]
+selected_seqs <- alignment[matched_labels, , drop = FALSE]
+
+selected_seqs
+
+# save
+write.nexus.data(as.character(selected_seqs), file = here("local/vsv_2023.nex"), format = "dna")
+```
+
+### New Dataframe
+```{r}
+# correct county names
+vsv_meta <- vsv_meta %>%
+  mutate(
+    county = case_when(
+      county == "San Bernadino" ~ "San Bernardino",
+      county == "San Luis" ~ "San Luis Obispo",
+      tip == "Tulare_10_2" ~ "Tulare",
+      TRUE ~ county
+    ),
+    date = if_else(is.na(date) & tip == "Santa_Barbara", as.Date("2023-07-20"), date)
+  )
+
+vsv_meta <- left_join(vsv_meta, coord_frame, by = "county")
+
+# Texas
+vsv_meta <- vsv_meta %>%
+  mutate(x = if_else(county == "Shakelford", -99.2786, x),
+         y = if_else(county == "Shakelford", 32.8242, y))
+
+mex_meta <- as.data.frame( # guessing
+  cbind(
+  tip = "Mexico2023",
+  date = "2023-01-15",
+  county = "Sonora",
+  x = -110.3309,
+  y = 29.2972
+  )
+)
+
+mex_meta$date <- as_date(mex_meta$date)
+
+vsv_meta <- rbind(mex_meta, vsv_meta)
+
+vsv_meta <- vsv_meta %>%
+  mutate(x = as.numeric(x),
+         y = as.numeric(y))
+
+range(vsv_meta$date)
+```
+
+## Substitution Model
+```{r}
+aligned_phyDat <- as.phyDat(selected_seqs)
+  
+# run the test, compare the models
+mt <- modelTest(aligned_phyDat)
+
+mt %>% 
+  arrange(AIC) %>%
+  slice_head(n=5) 
+
+env <- attr(mt, "env")
+best_mod <- eval(get("GTR+I", env), env) 
+
+best_mod
+```
+
+## Maximum Likelihood Tree
+```{r}
+fit1 <- optim.pml(best_mod, # best model 
+                 optNni = FALSE, optBf = TRUE, 
+                 optQ = TRUE, optInv = TRUE, 
+                 optGamma = FALSE, optEdge = FALSE, 
+                 optRate = TRUE, 
+                 control = pml.control(epsilon = 1e-08,
+                                       maxit = 200, trace = 0))
+
+#Fix substitution model and fit tree
+fit2 <- optim.pml(fit1, 
+                 optNni = TRUE, optBf = FALSE,
+                 optQ = FALSE, optInv = FALSE, 
+                 optGamma = FALSE, optEdge = TRUE,
+                 control = pml.control(epsilon = 1e-08, 
+                                       maxit = 200, trace = 0))
+
+#Fine tune
+fit3 <- optim.pml(fit2, 
+                 optNni = TRUE, optBf = TRUE,
+                 optQ = TRUE, optInv = TRUE, 
+                 optGamma = FALSE, optEdge = TRUE, 
+                 optRate = FALSE,
+                 control = pml.control(epsilon = 1e-08, 
+                                       maxit = 200, trace = 0))
+```
+
+## Bootstrap
+```{r message=FALSE, warning=FALSE}
+set.seed(1976)
+boots <- bootstrap.pml(fit3,
+                       bs = 500, # reduced for render
+                       optNni = TRUE,
+                       control = pml.control(trace = 0))
+```
+
+### View ML Tree
+Node values suggest high uncertainty, likely do to high-relatedness.  
+```{r fig.width=10, fig.height=10, message=FALSE, warning=FALSE}
+ml_tree <- fit3$tree
+
+bs_tree <- plotBS(midpoint(ml_tree), boots, 
+       type="p", cex=0.4,
+       bs.adj = c(1.25, 1.25),
+       bs.col = "black")
+
+plotBS(bs_tree)
+add.scale.bar()
+title("Maximum Likelihood")
+```
+  
+## Time Calibrated Tree
+  
+### Temporal Signal
+```{r message=FALSE, warning=FALSE, fig.height=6, fig.width=6}
+check_tree <- midpoint(ml_tree)
+rtips <- adephylo::distRoot(check_tree)
+
+vsv_meta$date_dec <- decimal_date(vsv_meta$date)
+
+date_vector <- setNames(vsv_meta$date_dec, vsv_meta$tip)
+date_vector <- date_vector[check_tree$tip.label]
+
+
+plot(date_vector, rtips, xlab = "Sampling date", ylab = "Root-to-tip distance")
+abline(lm(rtips ~ date_vector), col = "red")
+summary(lm(rtips ~ date_vector))
+```
+
+Save dates file for BEAST
+```{r}
+dates_file <- vsv_meta %>%
+  select(tip, date_dec)
+
+write.table(dates_file,
+            file = here("local/vsv_dates.txt"),
+            sep = "\t",
+            row.names = FALSE,
+            col.names = TRUE,
+            quote = FALSE)
+```
+
+### Tracer Stats
+```{r}
+tracer_stats <- get_tracer_stats(here("local/vsv_2023.log"), use_burnin=0.10)
+tracer_stats
+```
+
+### View Time Tree
+```{r fig.width=10, fig.height=10, message=FALSE, warning=FALSE}
+mcc_tree <- read.beast(here("local/vsv_mcc.tree"))
+tree_data <- as_tibble(mcc_tree)
+
+p <- ggtree(mcc_tree, aes(color = posterior), mrsd="2023-11-08") +
+  theme_tree2() +
+  geom_tiplab(size = 3) +
+  geom_text2(
+    aes(label = ifelse(!isTip & !is.na(posterior), sprintf("%.2f", posterior), "")),
+    hjust = -0.2, size = 2.8, color = "black"
+  ) +
+  scale_color_gradient(low = "gray60", high = "red") +
+  labs(title = "VSV 2023 (MCC Tree)", color = "Posterior\nsupport") +
+  theme(
+    plot.margin = unit(c(0.5, 0.25, 0.5, 0.25), "cm"),
+    legend.key.width = unit(1, "line"),
+    legend.key.height = unit(2, "line"),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 14, face = "bold"),
+    legend.position = c(0.2, 0.7),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    axis.title.x = element_text(size = 16, face = "bold")
+  ) +
+  scale_x_continuous(
+    name = "  ",
+    expand = c(0.01, 0)
+  )
+
+p
+
+ggsave(here("images/vsv_tree.pdf"), p, width = 16, height = 10, units = "in")
+```
+
+
+## Geographic Signal
+
+Prepare data
+```{r}
+# genetic distances
+gen_dist <- dist.dna(selected_seqs, model = "raw")
+
+# geographic distances
+geo_dist <- geosphere::distm(
+  as.matrix(
+    vsv_meta[, c("x", "y")]
+    )
+  )
+
+# matrix names
+rownames(geo_dist) <- vsv_meta$tip
+colnames(geo_dist) <- vsv_meta$tip
+
+# order
+tips_order <- vsv_meta$tip
+gen_dist <- as.matrix(gen_dist)[tips_order, tips_order]
+geo_dist <- geo_dist[tips_order, tips_order]
+
+```
+
+### Mantel Test
+Strong geographic signal
+```{r}
+mantel_result <- vegan::mantel(as.dist(gen_dist), 
+                               as.dist(geo_dist), 
+                               method = "pearson", 
+                               permutations = 9999)
+mantel_result
+```
+
+Save locations file for BEAST
+```{r}
+locs_file <- vsv_meta %>%
+  select(tip, county)
+
+write.table(locs_file,
+            file = here("local/vsv_locs.txt"),
+            sep = "\t",
+            row.names = FALSE,
+            col.names = TRUE,
+            quote = FALSE)
+```
+
+## Phylodynamics (Ne)
+```{r}
+mcc_tree_phy <- read.nexus(here("local/vsv_mcc.tree"))
+
+coal_pref <- phylodyn::BNPR(mcc_tree_phy, lengthout = 500, 
+                               prec_alpha = 0.001, 
+                               prec_beta = 0.001,
+                               beta1_prec = 0.0001, 
+                               fns = NULL, 
+                               log_fns = FALSE, 
+                               simplify = TRUE,
+                               derivative = FALSE, 
+                               forward = TRUE)
+
+coal_pref_df <- as.data.frame(
+  cbind(
+    date = coal_pref$x,
+    Ne = coal_pref$effpop,
+    Ne.low = coal_pref$effpop025,
+    Ne.high = coal_pref$effpop975))
+```
+
+### Plot Ne Dynamics
+```{r fig.width=10, fig.height=10, message=FALSE, warning=FALSE}
+
+coal_pref_df$date <- as.Date("2023-11-08") - days(round(coal_pref_df$date*365.25,0))
+coal_pref_df = arrange(coal_pref_df, desc(date))
+
+log_breaks <- function(limits) {
+  10^pretty(log10(range(limits)))
+}
+
+log_format <- function(x) {
+  parse(text = paste("10^", round(log10(x)), sep = ""))
+}
+
+x_min <- as_date("2022-12-01", format = "%Y-%m-%d")
+x_max <- as_date("2023-11-20", format = "%Y-%m-%d")
+
+
+ymin <- floor(log10(min(coal_pref_df$Ne.low, na.rm = TRUE)))
+ymax <- ceiling(log10(max(coal_pref_df$Ne.high, na.rm = TRUE)))
+log_breaks <- 10^(ymin:ymax)
+
+gg_phylo <- ggplot(coal_pref_df, aes(date, Ne)) + 
+  geom_ribbon(aes(ymin = Ne.low, ymax = Ne.high), fill = "steelblue", alpha = 0.3) +
+  geom_line(col = "black", linewidth=1) +
+  scale_x_date(date_breaks = "60 days", date_labels = "%b %Y",
+               limits = c(x_min, x_max)) + 
+  scale_y_continuous(
+    trans = "log10",
+    breaks = log_breaks,
+    labels = scales::trans_format("log10", math_format(10^.x))
+  ) +
+  ylab("Effective Population Size (Ne)") +
+  xlab(" ") +
+  theme_minimal() +
+  theme(
+    plot.margin = unit(c(2,0.5,2,0.5),"cm"),
+    legend.direction = "vertical",
+    legend.position= c(0.9, 0.8), 
+    strip.text = element_text(size=26, face="bold"),
+    strip.background = element_blank(),
+    legend.key.size = unit(2,"line"),
+    legend.key.width = unit(1,"line"),
+    legend.text = element_text(size=16, face="bold"),
+    legend.title = element_text(size=18, face="bold"),
+    axis.title.x = element_text(size=24, face="bold"),
+    axis.title.y = element_text(size=24, face="bold"),
+    axis.text.x = element_text(face="bold", size=12, vjust=1, hjust=1, angle=45),
+    axis.text.y = element_text(size=12, face="bold"),
+    plot.title = element_text(size=28, face="bold")
+  )
+
+gg_phylo
+```
+
+## Phylogeography
+```{r}
+tracer_geog <- get_tracer_stats(here("local/phylogeog/vsv_2023_geog.log"), use_burnin=0.10)
+tracer_geog[1:14,]
+```
+
+### Geographic Tree
+```{r fig.width=10, fig.height=10, message=FALSE, warning=FALSE}
+mcc_tree <- read.beast(here("local/phylogeog/mcc_geog.tree"))
+tree_data <- as_tibble(mcc_tree)
+
+p <- ggtree(mcc_tree, aes(color = posterior), mrsd="2023-11-08") +
+  theme_tree2() +
+  geom_tiplab(size = 3) +
+  geom_text2(
+    aes(label = ifelse(!isTip & !is.na(posterior), sprintf("%.2f", posterior), "")),
+    hjust = -0.2, size = 2.8, color = "black"
+  ) +
+  scale_color_gradient(low = "gray60", high = "red") +
+  labs(title = "VSV 2023 (MCC Tree)", color = "Posterior\nsupport") +
+  theme(
+    plot.margin = unit(c(0.5, 0.25, 0.5, 0.25), "cm"),
+    legend.key.width = unit(1, "line"),
+    legend.key.height = unit(2, "line"),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 14, face = "bold"),
+    legend.position = c(0.2, 0.7),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    axis.title.x = element_text(size = 16, face = "bold")
+  ) +
+  scale_x_continuous(
+    name = "  ",
+    expand = c(0.01, 0)
+  )
+
+p
+
+ggsave(here("images/vsv_geotree.pdf"), p, width = 16, height = 10, units = "in")
+```
+
+
+### Transitions Network
+```{r}
+tree <- read.beast(here("local/phylogeog/location_mcc.tree"))
+df <- as_tibble(tree) %>%
+  as.data.frame()
+
+edges <- tree@phylo$edge
+df$node_num <- 1:nrow(df)
+migrations <- data.frame(
+  from = df$location[edges[,1]],
+  to   = df$location[edges[,2]],
+  parent = edges[,1],
+  child = edges[,2]
+)
+
+migrations <- subset(migrations, from != to & !is.na(from) & !is.na(to))
+```
+
+Match Coordinates
+```{r}
+locs_match <- vsv_meta %>%
+  mutate(location = gsub(" ", "", county)) %>%
+  select(location, x, y) %>%
+  distinct()
+
+# from set
+tmp_from <- migrations %>%
+  select(from) %>%
+  left_join(locs_match, by = c("from" = "location"))
+names(tmp_from) <- c("from", "x_from", "y_from")
+
+# to set
+tmp_to <- migrations %>%
+  select(to) %>%
+  left_join(locs_match, by = c("to" = "location"))
+names(tmp_to) <- c("to", "x_to", "y_to")
+
+# Combine
+migrations_plot <- migrations %>%
+  bind_cols(tmp_from[, -1], tmp_to[, -1])
+
+latest_sample_date <- 2023 + (as.numeric(as.Date("2023-11-08") - as.Date("2023-01-01")) / 365.25)  # ≈2023.86
+
+migrations_plot <- migrations_plot %>%
+  left_join(df %>% select(node, height), by = c("child" = "node")) %>%
+  mutate(migration_time = latest_sample_date - as.numeric(height))
+```
+
+Organize labels and boundaries
+```{r fig.width=10, fig.height=10, message=FALSE, warning=FALSE}
+locs_labels <- vsv_meta %>%
+  mutate(location = gsub(" ", "", county)) %>%
+  select(location, county, x, y) %>%
+  distinct()
+
+us_states <- tigris::states(class = "sf", year = 2022)
+western_states <- c(
+  "California", "Oregon", "Washington", "Nevada", "Idaho", "Texas",
+  "Utah", "Arizona", "Colorado", "New Mexico", "Montana", "Wyoming",
+  "Oklahoma", "Kansas", "Nebraska"
+)
+us_west_sf <- us_states %>% filter(NAME %in% western_states)
+
+# Mexico
+mex_states <- ne_states(country = "Mexico", returnclass = "sf")
+
+# Northern Mexico states
+n_mexico <- c("Sonora", "Chihuahua", "Coahuila", "Nuevo León", "Tamaulipas", "Baja California")
+mex_north_sf <- mex_states %>% filter(name %in% n_mexico)
+```
+
+### Network Map
+```{r fig.width=10, fig.height=10, message=FALSE, warning=FALSE}
+phylogeo_map <- ggplot() +
+  geom_sf(data = mex_states, fill = "gray95", color = "gray70") +
+  geom_sf(data = us_west_sf, fill = "white", color = "gray40", linewidth = 0.5) +
+  geom_sf(data = ca_counties, fill = "white", color = "gray40", linewidth = 0.5) +
+  geom_point(data = locs_match, aes(x = x, y = y), size = 3, color = "dodgerblue") +
+  geom_segment(
+    data = migrations_plot,
+    aes(x = x_from, y = y_from, xend = x_to, yend = y_to, color = migration_time),
+    arrow = arrow(length = unit(0.30, "cm"), type = "closed"),
+    alpha = 0.8,
+    linewidth = 1.5
+  ) +
+  scale_color_viridis_c(option = "D", name = "Migration Date",
+                        limits = c(2022.9, 2023.9)) +
+  geom_text(
+    data = locs_labels,
+    aes(x = x, y = y, label = county),
+    nudge_y = 0.2,
+    nudge_x = 0.1, 
+    fontface = "bold", size = 3.5
+  ) +
+  coord_sf(
+    xlim = c(-125, -89), ylim = c(26, 43), expand = FALSE
+  ) +
+  theme_minimal() +
+  theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.position = "right",
+      legend.title = element_text(size = 16, face = "bold"),
+      legend.text = element_text(size = 10, face = "bold"),
+      legend.key.width = unit(1, "line"),
+      legend.key.height = unit(2, "line"),
+      strip.text     = element_text(size = 18, face = "bold", color = "gray40"),
+      axis.title.x   = element_text(size = 20, face = "bold"),
+      axis.title.y   = element_text(size = 20, face = "bold"),
+      axis.text.x    = element_text(size = 10, face = "bold"),
+      axis.text.y    = element_text(size = 10, face = "bold"),
+      plot.title     = element_text(size = 22, face = "bold", hjust = 0.5)
+    ) +
+  labs(
+    x = "Longitude",
+    y = "Latitude",
+    title = "VSV Migration Network"
+  )
+
+phylogeo_map 
+
+ggsave(here("images/vsv_phylogeog.pdf"), phylogeo_map , width = 16, height = 10, units = "in")
+```
+
+
+

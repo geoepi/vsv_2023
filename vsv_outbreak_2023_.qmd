@@ -529,7 +529,7 @@ mex_north_sf <- mex_states %>% filter(name %in% n_mexico)
 ```
 
 ### Network Map
-```{r fig.width=10, fig.height=10, message=FALSE, warning=FALSE}
+```{r fig.width=15, fig.height=15, message=FALSE, warning=FALSE}
 phylogeo_map <- ggplot() +
   geom_sf(data = mex_states, fill = "gray95", color = "gray70") +
   geom_sf(data = us_west_sf, fill = "white", color = "gray40", linewidth = 0.5) +
